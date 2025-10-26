@@ -270,11 +270,11 @@ resource "aws_cloudfront_distribution" "public_cloudfront_distribution" {
     default_ttl            = 3600
     max_ttl                = 86400
 
-    lambda_function_association {
-      event_type   = "viewer-request"
-      lambda_arn   = aws_lambda_function.lambda_edge_cognito_auth.qualified_arn
-      include_body = false
-    }
+    # lambda_function_association {
+    #   event_type   = "viewer-request"
+    #   lambda_arn   = aws_lambda_function.lambda_edge_cognito_auth.qualified_arn
+    #   include_body = false
+    # }
   }
 
   restrictions {
@@ -323,4 +323,209 @@ data "aws_iam_policy_document" "s3_bucket_policy_public_content" {
 resource "aws_s3_bucket_policy" "public_website_bucket_policy" {
   bucket = aws_s3_bucket.public_content_bucket.id
   policy = data.aws_iam_policy_document.s3_bucket_policy_public_content.json
+}
+
+#################################################
+# CloudFront（プレビューサイト用）を作成
+#################################################
+resource "aws_cloudfront_origin_access_control" "preview_cloudfront_oac" {
+  name                              = "${var.project_name}-preview-cloudfront-oac"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "preview_cloudfront_distribution" {
+  enabled             = true
+  is_ipv6_enabled     = true
+  comment             = "CloudFront Distribution for Preview Static Website"
+  default_root_object = "index.html"
+
+  origin {
+    domain_name              = aws_s3_bucket.preview_content_bucket.bucket_regional_domain_name
+    origin_id                = "S3-${aws_s3_bucket.preview_content_bucket.id}"
+    origin_access_control_id = aws_cloudfront_origin_access_control.preview_cloudfront_oac.id
+  }
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
+    cached_methods   = ["GET", "HEAD", "OPTIONS"]
+    target_origin_id = "S3-${aws_s3_bucket.preview_content_bucket.id}"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  tags = merge(
+    var.default_tags,
+    {
+      Name = "${var.project_name}-preview-cloudfront-distribution"
+    }
+  )
+}
+
+data "aws_iam_policy_document" "s3_bucket_policy_preview_content" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.preview_content_bucket.arn}/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.preview_cloudfront_distribution.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "preview_website_bucket_policy" {
+  bucket = aws_s3_bucket.preview_content_bucket.id
+  policy = data.aws_iam_policy_document.s3_bucket_policy_preview_content.json
+}
+
+#################################################
+# SFTPでのファイルアップロードの仕組みの作成（Transfer Family、Lambda IdP）
+#################################################
+resource "aws_iam_role" "transfer_access_role" {
+  name = "${var.project_name}-transfer-access-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "transfer.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "transfer_access_role_policy" {
+  name = "${var.project_name}-transfer-access-role-policy"
+  role = aws_iam_role.transfer_access_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+          "s3:PutObject",
+          "s3:GetObject"
+        ],
+        Resource = [
+          aws_s3_bucket.public_content_bucket.arn,
+          aws_s3_bucket.preview_content_bucket.arn
+        ]
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject",
+          "s3:PutObjectAcl"
+        ],
+        Resource = [
+          "${aws_s3_bucket.preview_content_bucket.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "transfer_idp_lambda_role" {
+  name = "${var.project_name}-transfer-idp-lambda-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        },
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+resource "aws_iam_role_policy" "transfer_idp_lambda_role_policy" {
+  name = "${var.project_name}-transfer-idp-lambda-role-policy"
+  role = aws_iam_role.transfer_idp_lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "cognito-idp:AdminGetUser",
+          "cognito-idp:ListUsers"
+        ],
+        Resource = aws_cognito_user_pool.static_website_user_pool.arn
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "transfer_idp" {
+  function_name    = "${var.project_name}-transfer-idp"
+  role             = aws_iam_role.transfer_idp_lambda_role.arn
+  handler          = "lambda_idp_cognito_auth.handler"
+  runtime          = "python3.10"
+  filename         = "../python/lambda_idp_cognito_auth.zip"
+  source_code_hash = filebase64sha256("../python/lambda_idp_cognito_auth.zip")
+
+  environment {
+    variables = {
+      USER_POOL_ID      = aws_cognito_user_pool.static_website_user_pool.id
+      HOME_BUCKET       = aws_s3_bucket.preview_content_bucket.bucket
+      TRANSFER_ROLE_ARN = aws_iam_role.transfer_access_role.arn
+    }
+  }
+
+}
+
+resource "aws_transfer_server" "sftp" {
+  identity_provider_type = "AWS_LAMBDA"
+  function               = aws_lambda_function.transfer_idp.arn
+  logging_role           = aws_iam_role.transfer_access_role.arn
+  protocols              = ["SFTP"]
+  endpoint_type          = "PUBLIC"
 }
