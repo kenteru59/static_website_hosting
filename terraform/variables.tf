@@ -31,11 +31,11 @@ variable "route53_hosted_zone_id" {
   description = "The Route53 Hosted Zone ID for the domain"
 }
 
-# コンテンツ公開をするS3バケットにあてるCloudFrontのTLS証明書のARN
-variable "cloudfront_certificate_arn" {
-  type        = string
-  description = "The ARN of the TLS certificate for CloudFront"
-}
+# # コンテンツ公開をするS3バケットにあてるCloudFrontのTLS証明書のARN
+# variable "cloudfront_certificate_arn" {
+#   type        = string
+#   description = "The ARN of the TLS certificate for CloudFront"
+# }
 
 variable "region_main" {
   type        = string

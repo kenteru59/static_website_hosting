@@ -168,7 +168,7 @@ resource "aws_iam_role" "lambda_edge_cognito_auth_role" {
         Principal = {
           Service = [
             "lambda.amazonaws.com",
-            "edgelambda.amazonaws.com"
+            "edgelambda.amazonaws.com" # cspell:disable-line
           ]
         },
         Action = "sts:AssumeRole"
@@ -223,17 +223,104 @@ resource "aws_lambda_function" "lambda_edge_cognito_auth" {
   source_code_hash = filebase64sha256("../python/lambda_edge_cognito_auth.zip")
   publish          = true
 
-  environment {
-    variables = {
-      USER_POOL_ID   = aws_cognito_user_pool.static_website_user_pool.id
-      COGNITO_REGION = var.region_main
-    }
-  }
-
   tags = merge(
     var.default_tags,
     {
       Name = "${var.project_name}-lambda-edge-cognito-auth"
     }
   )
+}
+
+#################################################
+# CloudFront（公開サイト用）を作成
+#################################################
+resource "aws_cloudfront_origin_access_control" "public_cloudfront_oac" {
+  name                              = "${var.project_name}-public-cloudfront-oac"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "public_cloudfront_distribution" {
+  enabled             = true
+  is_ipv6_enabled     = true
+  comment             = "CloudFront Distribution for Public Static Website"
+  default_root_object = "index.html"
+
+  origin {
+    domain_name              = aws_s3_bucket.public_content_bucket.bucket_regional_domain_name
+    origin_id                = "S3-${aws_s3_bucket.public_content_bucket.id}"
+    origin_access_control_id = aws_cloudfront_origin_access_control.public_cloudfront_oac.id
+  }
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
+    cached_methods   = ["GET", "HEAD", "OPTIONS"]
+    target_origin_id = "S3-${aws_s3_bucket.public_content_bucket.id}"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
+
+    lambda_function_association {
+      event_type   = "viewer-request"
+      lambda_arn   = aws_lambda_function.lambda_edge_cognito_auth.qualified_arn
+      include_body = false
+    }
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  # viewer_certificate {
+  #   acm_certificate_arn      = var.cloudfront_certificate_arn
+  #   ssl_support_method       = "sni-only"
+  #   minimum_protocol_version = "TLSv1.2_2021"
+  # }
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+
+  web_acl_id = aws_wafv2_web_acl.public_cloudfront_waf.arn
+
+  tags = merge(
+    var.default_tags,
+    {
+      Name = "${var.project_name}-public-cloudfront-distribution"
+    }
+  )
+}
+
+data "aws_iam_policy_document" "s3_bucket_policy_public_content" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.public_content_bucket.arn}/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.public_cloudfront_distribution.arn]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "public_website_bucket_policy" {
+  bucket = aws_s3_bucket.public_content_bucket.id
+  policy = data.aws_iam_policy_document.s3_bucket_policy_public_content.json
 }
