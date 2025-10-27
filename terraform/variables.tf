@@ -16,3 +16,9 @@ variable "region_main" {
   type        = string
   default     = "ap-northeast-1"
 }
+
+# stateファイルを保持するS3
+variable "state_file_bucket" {
+  type        = string
+  description = "state_file_bucket"
+}

@@ -2,3 +2,5 @@
 *.tfstate*
 *.tfvars
 .terraform*
+.history
+backend.hcl
